@@ -1,0 +1,261 @@
+@page "/interview/{SessionId:guid}"
+@attribute [Authorize]
+@rendermode InteractiveServer
+@inherits OwningComponentBase
+@inject IJSRuntime JS
+@inject NavigationManager Navigation
+@inject IInterviewEvents Events
+@inject IRealtimeCallMonitor Monitor
+
+<PageTitle>Interview room</PageTitle>
+
+@if (session is null)
+{
+    <p><em>@(notFound ? "Interview not found." : "Loading…")</em></p>
+    return;
+}
+
+<div class="interview-room">
+    <header class="d-flex justify-content-between align-items-center mb-3">
+        <div>
+            <h1 class="h4 mb-0">@session.Template.Title</h1>
+            <small class="text-body-secondary">
+                @if (questionNumber > 0) { <text>Question @questionNumber of up to @session.Template.MaxQuestions · @category</text> }
+                else { <text>Up to @session.Template.MaxQuestions questions · @session.Template.MaxDurationMinutes minutes</text> }
+            </small>
+        </div>
+        <span class="badge @StatusBadge">@StatusText</span>
+    </header>
+
+    @if (error is not null)
+    {
+        <div class="alert alert-danger">@error</div>
+    }
+
+    @if (state == RoomState.Ready)
+    {
+        <div class="card mb-3">
+            <div class="card-body">
+                <h2 class="h6">Before you start</h2>
+                <ul class="small mb-3">
+                    <li>The interviewer speaks and listens. You can interrupt it at any time, or ask it to clarify or repeat a question.</li>
+                    <li>Take your time. Pauses are fine.</li>
+                    <li>Your answers are transcribed and stored for assessment. Audio is not recorded.</li>
+                    <li>Scores are coaching feedback, not a hiring decision, and a person can review them.</li>
+                </ul>
+                <div class="form-check mb-3">
+                    <input class="form-check-input" type="checkbox" id="consent" @bind="consent" />
+                    <label class="form-check-label" for="consent">I agree to my answers being transcribed and assessed.</label>
+                </div>
+                <button class="btn btn-primary" disabled="@(!consent)" @onclick="StartAsync">
+                    @(session.Turns.Count > 0 ? "Resume interview" : "Start interview")
+                </button>
+            </div>
+        </div>
+    }
+
+    <div class="stage @(state == RoomState.Ready ? "d-none" : "")">
+        <div class="speakers">
+            <div class="speaker @(interviewerSpeaking ? "speaking" : "")">
+                <div class="avatar">AI</div>
+                <div>Interviewer</div>
+            </div>
+            <div class="speaker @(candidateSpeaking ? "speaking" : "")">
+                <canvas class="mic-meter" width="160" height="48" @ref="meterCanvas"></canvas>
+                <div>You @(muted ? "(muted)" : "")</div>
+            </div>
+        </div>
+
+        @* Captions are rendered by voice.js; Blazor never touches this element's children. *@
+        <div class="captions" @ref="captionsEl" aria-live="polite"></div>
+
+        <div class="controls">
+            <button class="btn btn-outline-secondary" disabled="@(state != RoomState.Live)" @onclick="ToggleMuteAsync">@(muted ? "Unmute" : "Mute")</button>
+            <button class="btn btn-outline-secondary" disabled="@(state != RoomState.Live)" @onclick="RepeatAsync">Repeat question</button>
+            @if (state == RoomState.ConnectionLost)
+            {
+                <button class="btn btn-warning" @onclick="ReconnectAsync">Reconnect</button>
+            }
+            <button class="btn btn-danger ms-auto" disabled="@(state is RoomState.Ended or RoomState.Ready)" @onclick="EndAsync">End interview</button>
+        </div>
+    </div>
+
+    <audio @ref="audioEl" autoplay></audio>
+</div>
+
+@code {
+    [Parameter] public Guid SessionId { get; set; }
+    [CascadingParameter] private Task<AuthenticationState> AuthState { get; set; } = null!;
+
+    private enum RoomState { Ready, Connecting, Live, ConnectionLost, Ended }
+
+    private InterviewSession? session;
+    private bool notFound;
+    private RoomState state = RoomState.Ready;
+    private bool consent;
+    private bool muted;
+    private bool interviewerSpeaking;
+    private bool candidateSpeaking;
+    private int questionNumber;
+    private string? category;
+    private string? error;
+
+    private ElementReference audioEl;
+    private ElementReference captionsEl;
+    private ElementReference meterCanvas;
+    private IJSObjectReference? voice;
+    private DotNetObjectReference<InterviewRoom>? selfRef;
+
+    private InterviewOrchestrator Orchestrator => ScopedServices.GetRequiredService<InterviewOrchestrator>();
+
+    protected override async Task OnInitializedAsync()
+    {
+        var userId = (await AuthState).User.GetUserId();
+        session = await Orchestrator.LoadAsync(SessionId, CancellationToken.None);
+
+        // Only the candidate can sit their own interview.
+        if (session is null || session.CandidateId != userId)
+        {
+            session = null;
+            notFound = true;
+            return;
+        }
+        if (!session.IsLive)
+        {
+            Navigation.NavigateTo($"interview/{SessionId}/report");
+            return;
+        }
+
+        questionNumber = session.Turns.Count;
+        category = session.CurrentTurn?.Category;
+        Events.QuestionAdvancedRaised += OnQuestionAdvanced;
+        Events.SessionEnded += OnSessionEnded;
+    }
+
+    private async Task StartAsync()
+    {
+        error = null;
+        state = RoomState.Connecting;
+        StateHasChanged();
+        try
+        {
+            voice ??= await JS.InvokeAsync<IJSObjectReference>("import", "./js/voice.js");
+            selfRef ??= DotNetObjectReference.Create(this);
+            await voice.InvokeVoidAsync("start", SessionId, selfRef, audioEl, captionsEl, meterCanvas);
+        }
+        catch (JSException ex)
+        {
+            // JSException.Message is "message\nstack"; only the first line is meant for people.
+            error = ex.Message.Split('\n', 2)[0].Trim();
+            state = session!.Turns.Count > 0 || state == RoomState.ConnectionLost ? RoomState.ConnectionLost : RoomState.Ready;
+        }
+    }
+
+    private async Task ReconnectAsync()
+    {
+        if (voice is not null) await voice.InvokeVoidAsync("stop");
+        await StartAsync();
+    }
+
+    private async Task ToggleMuteAsync()
+    {
+        muted = !muted;
+        await voice!.InvokeVoidAsync("setMuted", muted);
+    }
+
+    private async Task RepeatAsync() => await voice!.InvokeVoidAsync("askToRepeat");
+
+    private async Task EndAsync()
+    {
+        state = RoomState.Ended;
+        if (voice is not null) await voice.InvokeVoidAsync("stop");
+        await Orchestrator.FinishAsync(SessionId, CancellationToken.None);
+        Monitor.Detach(SessionId);
+        Navigation.NavigateTo($"interview/{SessionId}/report");
+    }
+
+    [JSInvokable]
+    public Task OnStatus(string status)
+    {
+        state = status switch
+        {
+            "live" => RoomState.Live,
+            "connection-lost" when state != RoomState.Ended => RoomState.ConnectionLost,
+            "connecting" or "requesting-microphone" => RoomState.Connecting,
+            _ => state
+        };
+        return InvokeAsync(StateHasChanged);
+    }
+
+    [JSInvokable]
+    public Task OnInterviewerSpeaking(bool speaking)
+    {
+        interviewerSpeaking = speaking;
+        return InvokeAsync(StateHasChanged);
+    }
+
+    [JSInvokable]
+    public Task OnCandidateSpeaking(bool speaking)
+    {
+        candidateSpeaking = speaking;
+        return InvokeAsync(StateHasChanged);
+    }
+
+    private void OnQuestionAdvanced(QuestionAdvanced e)
+    {
+        if (e.SessionId != SessionId) return;
+        questionNumber = e.Number;
+        category = e.Category;
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    /// <summary>Ended by the interviewer (end_interview) or the time limit: let the goodbye play, then hang up.</summary>
+    private void OnSessionEnded(Guid id)
+    {
+        if (id != SessionId || state == RoomState.Ended) return;
+        _ = InvokeAsync(async () =>
+        {
+            state = RoomState.Ended;
+            StateHasChanged();
+            await Task.Delay(TimeSpan.FromSeconds(8));
+            if (voice is not null) await voice.InvokeVoidAsync("stop");
+            Monitor.Detach(SessionId);
+            Navigation.NavigateTo($"interview/{SessionId}/report");
+        });
+    }
+
+    private string StatusText => state switch
+    {
+        RoomState.Ready => "Ready",
+        RoomState.Connecting => "Connecting…",
+        RoomState.Live => interviewerSpeaking ? "Interviewer speaking" : candidateSpeaking ? "Listening" : "Live",
+        RoomState.ConnectionLost => "Connection lost",
+        _ => "Ended"
+    };
+
+    private string StatusBadge => state switch
+    {
+        RoomState.Live => "text-bg-success",
+        RoomState.ConnectionLost => "text-bg-warning",
+        RoomState.Ended => "text-bg-secondary",
+        _ => "text-bg-light"
+    };
+
+    protected override async ValueTask DisposeAsyncCore()
+    {
+        Events.QuestionAdvancedRaised -= OnQuestionAdvanced;
+        Events.SessionEnded -= OnSessionEnded;
+        try
+        {
+            // Leaving the page hangs up the call. The interview stays in progress and can be resumed.
+            if (voice is not null)
+            {
+                await voice.InvokeVoidAsync("stop");
+                await voice.DisposeAsync();
+            }
+        }
+        catch (JSDisconnectedException) { }
+        selfRef?.Dispose();
+        await base.DisposeAsyncCore();
+    }
+}

@@ -1,0 +1,164 @@
+@page "/interview/{SessionId:guid}/report"
+@attribute [Authorize]
+@rendermode InteractiveServer
+@inherits OwningComponentBase
+@inject IInterviewEvents Events
+
+<PageTitle>Interview report</PageTitle>
+
+@if (session is null)
+{
+    <p><em>@(notFound ? "Report not found." : "Loading…")</em></p>
+    return;
+}
+
+<h1 class="h4">@session.Template.Title: report</h1>
+<p class="text-body-secondary small">
+    @session.CreatedAt.LocalDateTime.ToString("f") · @session.Turns.Count question(s) · Rubric v@(session.Rubric.Version)
+</p>
+
+@switch (session.Status)
+{
+    case InterviewStatus.Abandoned:
+        <div class="alert alert-secondary">This interview ended before any answers were captured, so there is nothing to assess.</div>
+        break;
+    case InterviewStatus.EvaluationFailed:
+        <div class="alert alert-danger">The assessment could not be completed. It is retried automatically when the service restarts.</div>
+        break;
+    case InterviewStatus.Completed or InterviewStatus.Evaluating:
+        <div class="alert alert-info">Your answers are being assessed. This page updates automatically.</div>
+        break;
+}
+
+@if (session.Report is { } report)
+{
+    <div class="row g-3 mb-4">
+        <div class="col-md-4">
+            <div class="card h-100 text-center">
+                <div class="card-body">
+                    <div class="display-5">@report.EffectiveScore.ToString("0")</div>
+                    <div class="text-body-secondary">out of 100</div>
+                    @if (report.AdjustedScore is not null)
+                    {
+                        <div class="small mt-2">Adjusted by a reviewer (AI score @report.TotalScore.ToString("0.#"))</div>
+                    }
+                    @if (report.NeedsHumanReview)
+                    {
+                        <span class="badge text-bg-warning mt-2">Some answers need human review</span>
+                    }
+                </div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="card h-100"><div class="card-body">
+                <h2 class="h6">Strengths</h2>
+                @if (report.Strengths.Count == 0) { <p class="small text-body-secondary">None identified yet.</p> }
+                <ul class="small">@foreach (var s in report.Strengths) { <li>@s</li> }</ul>
+            </div></div>
+        </div>
+        <div class="col-md-4">
+            <div class="card h-100"><div class="card-body">
+                <h2 class="h6">Topics to study</h2>
+                <ul class="small">@foreach (var g in report.Gaps) { <li>@g</li> }</ul>
+            </div></div>
+        </div>
+    </div>
+    <p class="small text-body-secondary">@report.Summary</p>
+    @if (report.ReviewerNotes is not null)
+    {
+        <div class="alert alert-light"><strong>Reviewer notes:</strong> @report.ReviewerNotes</div>
+    }
+}
+
+<h2 class="h5 mt-4">Questions</h2>
+@foreach (var turn in session.Turns.OrderBy(t => t.SequenceNo))
+{
+    <div class="card mb-3">
+        <div class="card-header d-flex justify-content-between">
+            <span><strong>Q@(turn.SequenceNo)</strong> · @turn.Category · @turn.Difficulty</span>
+            @if (turn.Assessment is { } a)
+            {
+                <span>@a.WeightedScore.ToString("0")/100 @if (a.NeedsHumanReview) { <span class="badge text-bg-warning ms-1">Review</span> }</span>
+            }
+        </div>
+        <div class="card-body">
+            <p class="fw-semibold">@turn.QuestionText</p>
+            @if (turn.Assessment is { } assessment)
+            {
+                <div class="d-flex flex-wrap gap-2 mb-2">
+                    @foreach (var s in assessment.Scores)
+                    {
+                        var name = session.Rubric.Criteria.FirstOrDefault(c => c.Key == s.Criterion)?.Name ?? s.Criterion;
+                        <span class="badge text-bg-light border">@name: @s.Score/5</span>
+                    }
+                </div>
+                <p>@assessment.Feedback</p>
+                @if (assessment.Evidence.Count > 0)
+                {
+                    <ul class="small">
+                        @foreach (var e in assessment.Evidence)
+                        {
+                            <li>@e.Observation <span class="text-body-secondary">"@e.Quote"</span></li>
+                        }
+                    </ul>
+                }
+                @if (assessment.MissingConcepts.Count > 0)
+                {
+                    <p class="small mb-0"><strong>Missing:</strong> @string.Join(", ", assessment.MissingConcepts)</p>
+                }
+            }
+            <details class="mt-2">
+                <summary class="small">Transcript</summary>
+                @foreach (var u in turn.Utterances)
+                {
+                    <div class="small"><strong>@(u.Speaker == Speaker.Candidate ? "You" : "Interviewer"):</strong> @u.Text</div>
+                }
+            </details>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public Guid SessionId { get; set; }
+    [CascadingParameter] private Task<AuthenticationState> AuthState { get; set; } = null!;
+
+    private InterviewSession? session;
+    private bool notFound;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadAsync();
+        Events.ReportReady += OnReportReady;
+    }
+
+    private async Task LoadAsync()
+    {
+        var userId = (await AuthState).User.GetUserId();
+        var loaded = await ScopedServices.GetRequiredService<InterviewOrchestrator>().LoadAsync(SessionId, CancellationToken.None);
+        var access = ScopedServices.GetRequiredService<InterviewAccess>();
+        if (loaded is null || !await access.CanViewAsync(userId, loaded, CancellationToken.None))
+        {
+            notFound = true;
+            return;
+        }
+        session = loaded;
+    }
+
+    private void OnReportReady(Guid id)
+    {
+        if (id != SessionId) return;
+        _ = InvokeAsync(async () =>
+        {
+            // The component's DbContext has already tracked the old state, so read through a fresh scope.
+            using var scope = ScopedServices.GetRequiredService<IServiceScopeFactory>().CreateScope();
+            session = await scope.ServiceProvider.GetRequiredService<InterviewOrchestrator>().LoadAsync(SessionId, CancellationToken.None);
+            StateHasChanged();
+        });
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        Events.ReportReady -= OnReportReady;
+        base.Dispose(disposing);
+    }
+}

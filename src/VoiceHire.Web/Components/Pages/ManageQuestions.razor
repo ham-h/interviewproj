@@ -1,0 +1,296 @@
+@page "/manage/questions"
+@attribute [Authorize]
+@rendermode InteractiveServer
+@inherits OwningComponentBase
+@using VoiceHire.Application.QuestionBank
+
+<PageTitle>Question bank</PageTitle>
+
+<h1 class="h4">Question bank</h1>
+
+@if (orgIds is null)
+{
+    <p><em>Loading…</em></p>
+    return;
+}
+@if (orgIds.Count == 0)
+{
+    <div class="alert alert-secondary">
+        Managing questions needs reviewer or admin access. Ask an admin to add your email to <code>Pilot:AdminEmails</code>, then sign in again.
+    </div>
+    return;
+}
+
+@if (message is not null)
+{
+    <div class="alert @(messageIsError ? "alert-danger" : "alert-success")">@message</div>
+}
+
+<div class="card mb-4">
+    <div class="card-body">
+        <label class="form-label fw-semibold" for="template">Interview template</label>
+        <select id="template" class="form-select mb-2" value="@selectedValue" @onchange="OnTemplateChangedAsync">
+            @foreach (var t in templates)
+            {
+                <option value="@t.Id">@t.Title @(t.IsPublished ? "" : "(not published)")</option>
+            }
+            <option value="new">+ New template</option>
+        </select>
+
+        @if (selectedValue == "new")
+        {
+            <div class="row g-2 mt-1">
+                <div class="col-md-6"><input class="form-control" placeholder="Title, e.g. Backend developer screening" @bind="newTitle" /></div>
+                <div class="col-md-6"><input class="form-control" placeholder="Role, e.g. Mid-level .NET developer" @bind="newRole" /></div>
+                <div class="col-6 col-md-3"><label class="form-label small">Max questions</label><input type="number" min="1" max="20" class="form-control" @bind="newMaxQuestions" /></div>
+                <div class="col-6 col-md-3"><label class="form-label small">Minutes</label><input type="number" min="5" max="60" class="form-control" @bind="newDuration" /></div>
+                <div class="col-12"><button class="btn btn-primary" disabled="@(string.IsNullOrWhiteSpace(newTitle) || string.IsNullOrWhiteSpace(newRole))" @onclick="CreateTemplateAsync">Create template</button></div>
+            </div>
+        }
+        else if (Selected is { } template)
+        {
+            <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" id="published" checked="@template.IsPublished" @onchange="e => SetPublishedAsync((bool)e.Value!)" />
+                <label class="form-check-label" for="published">Published: candidates can take this interview</label>
+            </div>
+            <p class="small text-body-secondary mb-0">Role: @template.Role · up to @template.MaxQuestions questions · @template.MaxDurationMinutes minutes</p>
+        }
+    </div>
+</div>
+
+@if (Selected is not null)
+{
+    <div class="card mb-4">
+        <div class="card-body">
+            <h2 class="h6">Import questions from a document</h2>
+            <p class="small text-body-secondary">
+                Upload your own question list as PDF, Word (.docx) or text. The AI finds the questions and suggests a category, difficulty and
+                the concepts a good answer should cover. You review everything before it is added. The interviewer then asks only questions from this
+                template's bank, with natural follow-ups.
+            </p>
+            <p class="small text-body-secondary">
+                The document's text is sent to OpenAI to find the questions; the file itself is not stored. Don't upload documents containing personal data.
+            </p>
+            <div class="d-flex gap-2 align-items-center flex-wrap">
+                <InputFile OnChange="OnFileSelected" accept="@string.Join(',', ImportService.SupportedExtensions)" class="form-control" style="max-width: 420px" />
+                <button class="btn btn-primary" disabled="@(file is null || extracting)" @onclick="ExtractAsync">
+                    @(extracting ? "Finding questions…" : "Find questions")
+                </button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (draft is { } d)
+{
+    <div class="card mb-4">
+        <div class="card-body">
+            <h2 class="h6">Review @d.Questions.Count question(s) found in @d.FileName</h2>
+            @if (d.Truncated)
+            {
+                <div class="alert alert-warning small">The document was very long, so only the first part was read. Split it into smaller files to import the rest.</div>
+            }
+            @if (d.Questions.Count == 0)
+            {
+                <p>No interview questions were found in this document.</p>
+            }
+            else
+            {
+                <div class="table-responsive">
+                    <table class="table table-sm align-top">
+                        <thead><tr><th></th><th>Question</th><th style="width: 14%">Category</th><th style="width: 13%">Difficulty</th><th style="width: 26%">Expected concepts</th></tr></thead>
+                        <tbody>
+                            @foreach (var q in d.Questions)
+                            {
+                                <tr class="@(q.Include ? "" : "text-body-secondary")">
+                                    <td><input type="checkbox" class="form-check-input" @bind="q.Include" aria-label="Include question" /></td>
+                                    <td>
+                                        <textarea class="form-control form-control-sm" rows="2" @bind="q.Text"></textarea>
+                                        @if (!q.FoundInDocument)
+                                        {
+                                            <span class="badge text-bg-warning mt-1">Not found word-for-word in the document: check it</span>
+                                        }
+                                        @if (q.AlreadyInBank)
+                                        {
+                                            <span class="badge text-bg-secondary mt-1">Already in this bank</span>
+                                        }
+                                    </td>
+                                    <td><input class="form-control form-control-sm" @bind="q.Category" /></td>
+                                    <td>
+                                        <select class="form-select form-select-sm" @bind="q.Difficulty">
+                                            @foreach (var level in Enum.GetValues<Difficulty>())
+                                            {
+                                                <option value="@level">@level</option>
+                                            }
+                                        </select>
+                                    </td>
+                                    <td>
+                                        <input class="form-control form-control-sm" @bind="q.ExpectedConcepts" />
+                                        <span class="small text-body-secondary">@(q.ConceptsFromDocument ? "From your document" : "Suggested by AI")</span>
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+                <button class="btn btn-success" disabled="@(!d.Questions.Any(q => q.Include))" @onclick="SaveDraftAsync">
+                    Add @d.Questions.Count(q => q.Include) question(s) to the bank
+                </button>
+                <button class="btn btn-link" @onclick="() => draft = null">Discard</button>
+            }
+        </div>
+    </div>
+}
+
+@if (Selected is not null && bank is not null)
+{
+    <h2 class="h6">Questions in this bank (@bank.Count(q => q.IsActive) active)</h2>
+    @if (bank.Count == 0)
+    {
+        <p class="text-body-secondary">No questions yet. Import a document above.</p>
+    }
+    else
+    {
+        <div class="table-responsive">
+            <table class="table table-sm align-middle">
+                <thead><tr><th>Active</th><th>Question</th><th>Category</th><th>Difficulty</th><th>Source</th></tr></thead>
+                <tbody>
+                    @foreach (var q in bank)
+                    {
+                        <tr class="@(q.IsActive ? "" : "text-body-secondary")">
+                            <td><input type="checkbox" class="form-check-input" checked="@q.IsActive" @onchange="e => SetActiveAsync(q, (bool)e.Value!)" aria-label="Active" /></td>
+                            <td>@q.Text</td>
+                            <td>@q.Category</td>
+                            <td>@q.Difficulty</td>
+                            <td class="small">@(q.Source == QuestionSource.Imported ? q.SourceDocument : q.Source.ToString())</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    }
+}
+
+@code {
+    [CascadingParameter] private Task<AuthenticationState> AuthState { get; set; } = null!;
+
+    private string userId = "";
+    private List<Guid>? orgIds;
+    private List<InterviewTemplate> templates = [];
+    private string selectedValue = "new";
+    private List<Question>? bank;
+
+    private IBrowserFile? file;
+    private bool extracting;
+    private ImportDraft? draft;
+
+    private string? newTitle;
+    private string? newRole;
+    private int newMaxQuestions = 7;
+    private int newDuration = 20;
+
+    private string? message;
+    private bool messageIsError;
+
+    private QuestionImportService ImportService => ScopedServices.GetRequiredService<QuestionImportService>();
+    private InterviewTemplate? Selected => templates.FirstOrDefault(t => t.Id.ToString() == selectedValue);
+
+    protected override async Task OnInitializedAsync()
+    {
+        userId = (await AuthState).User.GetUserId();
+        orgIds = await ImportService.ManageableOrganizationIdsAsync(userId, CancellationToken.None);
+        if (orgIds.Count == 0) return;
+        await LoadTemplatesAsync(templates.FirstOrDefault()?.Id);
+    }
+
+    private async Task LoadTemplatesAsync(Guid? select)
+    {
+        templates = await ImportService.ManageableTemplatesAsync(userId, CancellationToken.None);
+        selectedValue = (select ?? templates.FirstOrDefault()?.Id)?.ToString() ?? "new";
+        await LoadBankAsync();
+    }
+
+    private async Task LoadBankAsync() =>
+        bank = Selected is { } t ? await ImportService.QuestionsAsync(userId, t.Id, CancellationToken.None) : null;
+
+    private async Task OnTemplateChangedAsync(ChangeEventArgs e)
+    {
+        selectedValue = e.Value?.ToString() ?? "new";
+        draft = null;
+        message = null;
+        await LoadBankAsync();
+    }
+
+    private async Task CreateTemplateAsync()
+    {
+        var template = await ImportService.CreateTemplateAsync(userId, orgIds![0], newTitle!, newRole!, newMaxQuestions, newDuration, CancellationToken.None);
+        newTitle = newRole = null;
+        await LoadTemplatesAsync(template.Id);
+        Show($"Created \"{template.Title}\". Now import its questions.");
+    }
+
+    private void OnFileSelected(InputFileChangeEventArgs e)
+    {
+        file = e.File;
+        draft = null;
+        message = null;
+    }
+
+    private async Task ExtractAsync()
+    {
+        if (file is null || Selected is null) return;
+        if (file.Size > QuestionImportService.MaxUploadBytes)
+        {
+            Show("The file is larger than 10 MB.", error: true);
+            return;
+        }
+
+        extracting = true;
+        message = null;
+        try
+        {
+            await using var stream = file.OpenReadStream(QuestionImportService.MaxUploadBytes);
+            draft = await ImportService.ExtractDraftsAsync(userId, Selected.Id, stream, file.Name, CancellationToken.None);
+        }
+        catch (UnsupportedDocumentException ex)
+        {
+            Show(ex.Message, error: true);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException or TaskCanceledException)
+        {
+            Show("The AI service couldn't process the document. Check that OpenAI:ApiKey is set, then try again.", error: true);
+        }
+        finally
+        {
+            extracting = false;
+        }
+    }
+
+    private async Task SaveDraftAsync()
+    {
+        if (draft is null || Selected is null) return;
+        var added = await ImportService.SaveAsync(userId, Selected.Id, draft.FileName, draft.Questions, CancellationToken.None);
+        draft = null;
+        file = null;
+        await LoadTemplatesAsync(Selected.Id);
+        Show($"Added {added} question(s). The template is published.");
+    }
+
+    private async Task SetActiveAsync(Question q, bool active)
+    {
+        await ImportService.SetActiveAsync(userId, q.Id, active, CancellationToken.None);
+        q.IsActive = active;
+    }
+
+    private async Task SetPublishedAsync(bool published)
+    {
+        await ImportService.SetPublishedAsync(userId, Selected!.Id, published, CancellationToken.None);
+        Selected!.IsPublished = published;
+    }
+
+    private void Show(string text, bool error = false)
+    {
+        message = text;
+        messageIsError = error;
+    }
+}

@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/VoiceHire.Application/VoiceHire.Application.csproj" />
+    <Project Path="src/VoiceHire.Domain/VoiceHire.Domain.csproj" />
+    <Project Path="src/VoiceHire.Infrastructure/VoiceHire.Infrastructure.csproj" />
+    <Project Path="src/VoiceHire.Web/VoiceHire.Web.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/VoiceHire.Tests/VoiceHire.Tests.csproj" />
+  </Folder>
+</Solution>

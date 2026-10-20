@@ -1,0 +1,141 @@
+﻿@page "/"
+@rendermode InteractiveServer
+@inherits OwningComponentBase
+@inject NavigationManager Navigation
+@using VoiceHire.Infrastructure.Persistence
+
+<PageTitle>VoiceHire AI</PageTitle>
+
+<AuthorizeView>
+    <NotAuthorized>
+        <h1>VoiceHire AI</h1>
+        <p class="lead">Practise spoken technical interviews with an AI interviewer that listens, adapts and gives evidence-based feedback.</p>
+        <a class="btn btn-primary" href="Account/Login">Log in</a>
+        <a class="btn btn-outline-secondary ms-2" href="Account/Register">Register</a>
+    </NotAuthorized>
+    <Authorized>
+        <h1>Interviews</h1>
+
+        @if (error is not null)
+        {
+            <div class="alert alert-danger">@error</div>
+        }
+
+        <h2 class="h5 mt-4">Start a practice interview</h2>
+        @if (templates is null)
+        {
+            <p><em>Loading…</em></p>
+        }
+        else if (templates.Count == 0)
+        {
+            <p>No interview templates are available to you yet. Ask your team lead to add you to an organization.</p>
+        }
+        else
+        {
+            <div class="row g-3">
+                @foreach (var t in templates)
+                {
+                    <div class="col-md-6 col-lg-4">
+                        <div class="card h-100">
+                            <div class="card-body">
+                                <h3 class="h6 card-title">@t.Title</h3>
+                                <p class="card-text small text-body-secondary">@t.Description</p>
+                                <p class="card-text small">Up to @t.MaxQuestions questions · @t.MaxDurationMinutes min</p>
+                            </div>
+                            <div class="card-footer bg-transparent border-0">
+                                <button class="btn btn-primary" disabled="@starting" @onclick="() => StartAsync(t.Id)">Start interview</button>
+                            </div>
+                        </div>
+                    </div>
+                }
+            </div>
+        }
+
+        <h2 class="h5 mt-5">Your interviews</h2>
+        @if (sessions is { Count: > 0 })
+        {
+            <table class="table table-sm align-middle">
+                <thead><tr><th>Interview</th><th>Date</th><th>Status</th><th>Score</th><th></th></tr></thead>
+                <tbody>
+                    @foreach (var s in sessions)
+                    {
+                        <tr>
+                            <td>@s.Title</td>
+                            <td>@s.CreatedAt.LocalDateTime.ToString("g")</td>
+                            <td><span class="badge text-bg-secondary">@s.Status</span></td>
+                            <td>@(s.Score?.ToString("0.#") ?? "—")</td>
+                            <td class="text-end">
+                                @if (s.Status is InterviewStatus.Created or InterviewStatus.InProgress)
+                                {
+                                    <a href="interview/@s.Id">Resume</a>
+                                }
+                                else
+                                {
+                                    <a href="interview/@s.Id/report">Report</a>
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+        else if (sessions is not null)
+        {
+            <p class="text-body-secondary">No interviews yet.</p>
+        }
+    </Authorized>
+</AuthorizeView>
+
+@code {
+    [CascadingParameter] private Task<AuthenticationState> AuthState { get; set; } = null!;
+
+    private List<TemplateDto>? templates;
+    private List<SessionRow>? sessions;
+    private string? userId;
+    private bool starting;
+    private string? error;
+
+    private sealed record SessionRow(Guid Id, string Title, DateTimeOffset CreatedAt, InterviewStatus Status, decimal? Score);
+
+    protected override async Task OnInitializedAsync()
+    {
+        var user = (await AuthState).User;
+        if (user.Identity?.IsAuthenticated != true) return;
+
+        userId = user.GetUserId();
+        await ScopedServices.GetRequiredService<PilotEnrollment>()
+            .EnsureEnrolledAsync(userId, user.Identity.Name, CancellationToken.None);
+
+        var db = ScopedServices.GetRequiredService<IAppDbContext>();
+        var orgIds = db.OrganizationMembers.Where(m => m.UserId == userId).Select(m => m.OrganizationId);
+        templates = await db.InterviewTemplates.AsNoTracking()
+            .Where(t => t.IsPublished && orgIds.Contains(t.OrganizationId))
+            .Select(t => new TemplateDto(t.Id, t.Title, t.Role, t.Description, t.MaxQuestions, t.MaxDurationMinutes))
+            .ToListAsync();
+
+        sessions = await db.InterviewSessions.AsNoTracking()
+            .Where(s => s.CandidateId == userId)
+            .OrderByDescending(s => s.CreatedAt)
+            .Take(20)
+            .Select(s => new SessionRow(s.Id, s.Template.Title, s.CreatedAt, s.Status,
+                s.Report == null ? null : (s.Report.AdjustedScore ?? s.Report.TotalScore)))
+            .ToListAsync();
+    }
+
+    private async Task StartAsync(Guid templateId)
+    {
+        starting = true;
+        error = null;
+        try
+        {
+            var session = await ScopedServices.GetRequiredService<InterviewOrchestrator>()
+                .CreateSessionAsync(userId!, templateId, CancellationToken.None);
+            Navigation.NavigateTo($"interview/{session.Id}");
+        }
+        catch (InterviewNotFoundException)
+        {
+            error = "That interview template is no longer available.";
+            starting = false;
+        }
+    }
+}
