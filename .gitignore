@@ -480,3 +480,7 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# Local database backups (contain user data; never commit)
+db-backup/
+*.bak
